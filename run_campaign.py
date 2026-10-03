@@ -7,5 +7,5 @@ parser.add_argument("--limit", type=int, default=None, help="Maximum emails this
 parser.add_argument("--min-score", type=float, default=None, help="Minimum AI match score")
 args = parser.parse_args()
 
-result = run_campaign(send=args.send, limit=args.limit, min_score=args.min_score)
+result = run_campaign(send="send" if args.send else "preview", limit=args.limit or 3, min_score=args.min_score)
 print("\nCampaign summary:", result)

@@ -2,10 +2,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    ollama_model: str = "minimax-m3:cloud"
-    ollama_host: str = "http://localhost:11434"
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash-lite"
     database_url: str = "sqlite:///./data/jobs.db"
     resume_path: str = "data/resume.pdf"
     linkedin_profile_text: str = ""
@@ -23,6 +19,8 @@ class Settings(BaseSettings):
     csv_files: str = "data/indore_it_jobs_mer_node_react_sept_2026.csv,data/indore_verified_mern_node_react_contacts_2026.csv"
     send_log_path: str = "data/send_log.csv"
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    groq_api_key: str = ""
+    groq_model: str = "openai/gpt-oss-20b"
 
     @property
     def csv_file_list(self) -> list[str]:

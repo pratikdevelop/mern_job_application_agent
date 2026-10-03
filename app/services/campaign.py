@@ -131,10 +131,10 @@ def build_campaign_preview():
         if key in sent:
             results.append({**job, "status": "already_sent"})
             continue
-        score = score_job(profile, job["title"], job["description"], job)
+        score = score_job(profile, job)
         email = None
         if score["score"] >= settings.min_score:
-            email = generate_email(profile, job["company"], job["title"], job["description"], job)
+            email = generate_email(candidate_profile=profile, job=job, score_result=score)
         results.append({**job, "status": "ready" if email else "below_score", "score": score["score"], "reason": score["reason"], "email": email})
     return profile, results
 
@@ -160,14 +160,14 @@ def run_campaign(send=False, limit=None, min_score=None):
         if key in sent:
             continue
 
-        score = score_job(profile, job["title"], job["description"], job)
+        score = score_job(profile, job)
         print(f"\n{job['company']} <{job['email']}> | {job['title']} | score={score['score']:.0f}")
         print(f"Reason: {score['reason']}")
         if score["score"] < min_score:
             print("SKIP: below minimum score")
             continue
 
-        email = generate_email(profile, job["company"], job["title"], job["description"], job)
+        email = generate_email( candidate_profile=profile,job=job,score_result=score)
         print(f"Subject: {email.get('subject', '')}")
         if not send:
             print("READY: personalized email generated; not sent")

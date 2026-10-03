@@ -1,12 +1,10 @@
-# app/services/ai.py
-
 from __future__ import annotations
 
 import json
 import re
 from typing import Any, List
 
-from google import genai
+from groq import Groq
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
@@ -14,27 +12,27 @@ from app.services.resume import extract_resume_text
 
 
 # ============================================================
-# Gemini Configuration
+# GROQ CONFIGURATION
 # ============================================================
 
-GEMINI_API_KEY = getattr(settings, "gemini_api_key", "") or ""
+GROQ_API_KEY = getattr(settings, "groq_api_key", "") or ""
 
-GEMINI_MODEL = (
-    getattr(settings, "gemini_model", "")
-    or "gemini-3.5-flash-lite"
+GROQ_MODEL = (
+    getattr(settings, "groq_model", "")
+    or "openai/gpt-oss-20b"
 )
 
-if not GEMINI_API_KEY:
+if not GROQ_API_KEY:
     raise RuntimeError(
-        "GEMINI_API_KEY is missing. "
-        "Add GEMINI_API_KEY=your_key to your .env file."
+        "GROQ_API_KEY is missing. "
+        "Add GROQ_API_KEY=your_key to your .env file."
     )
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = Groq(api_key=GROQ_API_KEY)
 
 
 # ============================================================
-# Pydantic Schemas
+# PYDANTIC SCHEMAS
 # ============================================================
 
 class ContactInfo(BaseModel):
@@ -53,48 +51,29 @@ class CandidateProfile(BaseModel):
     education: List[str] = Field(default_factory=list)
     projects: List[str] = Field(default_factory=list)
 
-    contact: ContactInfo = Field(default_factory=ContactInfo)
+    contact: ContactInfo = Field(
+        default_factory=ContactInfo
+    )
 
     linkedin_url: str = ""
     summary: str = ""
 
 
 class JobScore(BaseModel):
-    score: float = Field(
-        description="Candidate-job match score from 0 to 100."
-    )
-
-    reason: str = Field(
-        description="Short explanation of why the candidate matches."
-    )
-
-    matching_skills: List[str] = Field(
-        default_factory=list,
-        description="Skills from the candidate that match the job."
-    )
-
-    missing_skills: List[str] = Field(
-        default_factory=list,
-        description="Important job skills the candidate appears to lack."
-    )
-
-    recommendation: str = Field(
-        description="One of: apply, consider, skip."
-    )
+    score: float
+    reason: str
+    matching_skills: List[str]
+    missing_skills: List[str]
+    recommendation: str
 
 
 class JobEmail(BaseModel):
-    subject: str = Field(
-        description="Professional personalized email subject."
-    )
-
-    body: str = Field(
-        description="Professional personalized job application email."
-    )
+    subject: str
+    body: str
 
 
 # ============================================================
-# Helper Functions
+# HELPERS
 # ============================================================
 
 def _clean_text(value: Any) -> str:
@@ -110,56 +89,52 @@ def _clean_text(value: Any) -> str:
 
 
 def _safe_json(value: Any) -> str:
-    try:
-        return json.dumps(
-            value,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
-    except Exception:
-        return json.dumps(
-            str(value),
-            ensure_ascii=False,
-        )
-
-
-def _extract_output_text(interaction: Any) -> str:
-    """
-    Extract text from Gemini Interactions API response.
-    """
-
-    output_text = getattr(interaction, "output_text", None)
-
-    if output_text:
-        return str(output_text).strip()
-
-    outputs = getattr(interaction, "outputs", None)
-
-    if outputs:
-        parts: list[str] = []
-
-        for output in outputs:
-            text = getattr(output, "text", None)
-
-            if text:
-                parts.append(str(text))
-
-            content = getattr(output, "content", None)
-
-            if content:
-                for item in content:
-                    item_text = getattr(item, "text", None)
-
-                    if item_text:
-                        parts.append(str(item_text))
-
-        if parts:
-            return "\n".join(parts).strip()
-
-    raise RuntimeError(
-        "Gemini returned no text output."
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
     )
+
+
+def _schema_for(model: type[BaseModel]) -> dict:
+    """
+    Convert Pydantic schema to Groq strict JSON schema.
+
+    Groq strict structured output requires:
+    - all fields required
+    - additionalProperties = false
+    """
+
+    schema = model.model_json_schema()
+
+    def clean_object(obj: Any) -> Any:
+        if isinstance(obj, dict):
+
+            # Groq strict mode requires this for objects
+            if obj.get("type") == "object":
+                obj["additionalProperties"] = False
+
+                if "properties" in obj:
+                    obj["required"] = list(
+                        obj["properties"].keys()
+                    )
+
+            # Handle nested objects
+            for key, value in list(obj.items()):
+                obj[key] = clean_object(value)
+
+            return obj
+
+        if isinstance(obj, list):
+            return [
+                clean_object(item)
+                for item in obj
+            ]
+
+        return obj
+
+    return clean_object(schema)
 
 
 def _generate_structured(
@@ -167,70 +142,96 @@ def _generate_structured(
     schema: type[BaseModel],
 ) -> BaseModel:
     """
-    Call Gemini Interactions API and validate the response
-    using Pydantic.
+    Generate a strict structured response using Groq.
     """
 
+    json_schema = _schema_for(schema)
+
     try:
-        interaction = client.interactions.create(
-            model=GEMINI_MODEL,
-            input=prompt,
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional technical "
+                        "recruiter and job application assistant. "
+                        "Follow the requested JSON schema exactly."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+
             response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": schema.model_json_schema(),
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.__name__.lower(),
+                    "strict": True,
+                    "schema": json_schema,
+                },
             },
+
+            reasoning_effort="low",
         )
 
     except Exception as exc:
         raise RuntimeError(
-            f"Gemini API request failed using model "
-            f"'{GEMINI_MODEL}': {exc}"
+            f"Groq API request failed using model "
+            f"'{GROQ_MODEL}': {exc}"
         ) from exc
 
-    output_text = _extract_output_text(interaction)
+    content = (
+        response.choices[0]
+        .message
+        .content
+    )
 
-    if not output_text:
+    if not content:
         raise RuntimeError(
-            "Gemini returned an empty response."
+            "Groq returned an empty response."
         )
 
-    output_text = output_text.strip()
+    content = content.strip()
 
-    # Remove accidental markdown code fences
-    if output_text.startswith("```"):
-        output_text = re.sub(
+    # Safety cleanup in case markdown fences appear.
+    if content.startswith("```"):
+        content = re.sub(
             r"^```(?:json)?\s*",
             "",
-            output_text,
+            content,
             flags=re.IGNORECASE,
         )
 
-        output_text = re.sub(
+        content = re.sub(
             r"\s*```$",
             "",
-            output_text,
+            content,
         ).strip()
 
     try:
-        return schema.model_validate_json(output_text)
+        return schema.model_validate_json(content)
 
     except ValidationError as exc:
         raise RuntimeError(
-            "Gemini returned JSON that did not match the expected "
-            f"schema.\n\nGemini output:\n{output_text}\n\n"
+            "Groq returned JSON that did not match "
+            "the expected schema.\n\n"
+            f"Response:\n{content}\n\n"
             f"Validation error:\n{exc}"
         ) from exc
 
     except Exception as exc:
         raise RuntimeError(
-            "Unable to parse Gemini JSON response.\n\n"
-            f"Gemini output:\n{output_text}"
+            "Unable to parse Groq response.\n\n"
+            f"Response:\n{content}"
         ) from exc
 
 
 # ============================================================
-# Build Candidate Profile
+# BUILD CANDIDATE PROFILE
 # ============================================================
 
 def build_candidate_profile(
@@ -238,21 +239,26 @@ def build_candidate_profile(
     linkedin_profile_text: str | None = None,
 ) -> dict:
     """
-    Build candidate profile from resume + LinkedIn.
+    Build candidate profile.
 
-    Backward compatible:
+    Supports both:
+
         build_candidate_profile()
 
-    will automatically load the resume from settings.resume_path.
+    and:
+
+        build_candidate_profile(
+            resume_text,
+            linkedin_profile_text
+        )
     """
 
     # --------------------------------------------------------
-    # Automatically load resume if campaign.py calls:
-    #
-    #     build_candidate_profile()
+    # Automatically load resume
     # --------------------------------------------------------
 
     if not resume_text:
+
         resume_path = getattr(
             settings,
             "resume_path",
@@ -260,21 +266,26 @@ def build_candidate_profile(
         )
 
         try:
-            resume_text = extract_resume_text(resume_path)
+            resume_text = extract_resume_text(
+                resume_path
+            )
 
         except Exception as exc:
             raise RuntimeError(
-                f"Could not read resume from '{resume_path}'. "
-                f"Error: {exc}"
+                f"Could not read resume from "
+                f"'{resume_path}'. Error: {exc}"
             ) from exc
 
-    resume_text = _clean_text(resume_text)
+    resume_text = _clean_text(
+        resume_text
+    )
 
     # --------------------------------------------------------
     # LinkedIn
     # --------------------------------------------------------
 
     if linkedin_profile_text is None:
+
         linkedin_profile_text = getattr(
             settings,
             "linkedin_profile_text",
@@ -287,63 +298,59 @@ def build_candidate_profile(
 
     if not resume_text:
         raise ValueError(
-            "Resume text is empty. "
-            "Make sure your resume PDF exists at "
-            f"'{getattr(settings, 'resume_path', 'data/resume.pdf')}'."
+            "Resume text is empty."
         )
 
     prompt = f"""
-You are an expert technical recruiter and resume analyst.
+Analyze the candidate resume and LinkedIn information.
 
-Analyze the candidate information below and create a concise,
-accurate candidate profile.
+Create an accurate candidate profile.
 
-IMPORTANT RULES:
+IMPORTANT:
 
-1. Use ONLY information present in the provided resume and
-   LinkedIn text.
+1. Use ONLY information present in the provided data.
+2. Never invent experience.
+3. Never invent companies.
+4. Never invent projects.
+5. Never invent skills.
+6. Never invent education.
+7. Never invent contact information.
+8. Never invent LinkedIn URLs.
+9. If information is unavailable, use empty values.
+10. Estimate experience only from actual employment information.
+11. Extract relevant technical skills accurately.
+12. Focus on MERN, React, Node.js, JavaScript,
+    TypeScript, Angular, Python, MongoDB, SQL,
+    APIs, frontend and backend skills when present.
+13. Keep the summary concise.
 
-2. Never invent companies, projects, education, skills,
-   experience, certifications, URLs, phone numbers, or
-   email addresses.
+RESUME
+==================================================
 
-3. If information is unavailable, use an empty string,
-   empty list, or 0 where appropriate.
-
-4. Estimate experience_years only from explicit employment
-   experience.
-
-5. Keep skills specific and useful for job matching.
-
-6. Focus on MERN, Node.js, React, JavaScript, TypeScript,
-   Angular, Python, MongoDB, SQL, APIs, backend and frontend
-   skills when they actually appear in the source.
-
-7. Keep the summary concise and professional.
-
-RESUME:
-----------------
 {resume_text}
-----------------
 
-LINKEDIN PROFILE:
-----------------
+==================================================
+
+LINKEDIN
+==================================================
+
 {linkedin_profile_text}
-----------------
 
-Return only the structured candidate profile.
+==================================================
+
+Return the candidate profile.
 """
 
     result = _generate_structured(
-        prompt=prompt,
-        schema=CandidateProfile,
+        prompt,
+        CandidateProfile,
     )
 
     return result.model_dump()
 
 
 # ============================================================
-# Score Job
+# SCORE JOB
 # ============================================================
 
 def score_job(
@@ -351,76 +358,94 @@ def score_job(
     job: dict,
 ) -> dict:
     """
-    Compare candidate profile against a job.
+    Score candidate against a job from 0 to 100.
     """
 
-    candidate_json = _safe_json(candidate_profile)
-    job_json = _safe_json(job)
+    candidate_json = _safe_json(
+        candidate_profile
+    )
+
+    job_json = _safe_json(
+        job
+    )
 
     prompt = f"""
-You are an experienced technical recruiter.
+Evaluate how well the candidate matches the job.
 
-Evaluate how well this candidate matches this job.
+CANDIDATE
+==================================================
 
-CANDIDATE PROFILE:
-----------------
 {candidate_json}
-----------------
 
-JOB:
-----------------
+==================================================
+
+JOB
+==================================================
+
 {job_json}
-----------------
 
-SCORING RULES:
+==================================================
+
+SCORING:
 
 0-39:
-Very poor match. Recommend skip.
+Very poor match. Recommendation = skip.
 
 40-59:
-Weak match. Recommend skip or consider.
+Weak match. Recommendation = skip.
 
 60-74:
-Reasonable match. Recommend consider.
+Reasonable match. Recommendation = consider.
 
 75-89:
-Strong match. Recommend apply.
+Strong match. Recommendation = apply.
 
 90-100:
-Excellent match. Recommend apply.
+Excellent match. Recommendation = apply.
 
 Consider:
 
-- Required technical skills
-- Preferred technical skills
+- Required skills
+- Preferred skills
 - Years of experience
-- Relevant role/title
-- Frontend/backend experience
-- MERN/React/Node.js experience
-- JavaScript/TypeScript experience
-- MongoDB/database experience
-- Python/Angular experience when relevant
-- Project relevance
+- Job title
+- Relevant projects
+- Frontend experience
+- Backend experience
+- React
+- Node.js
+- JavaScript
+- TypeScript
+- MongoDB
+- Angular
+- Python
+- APIs
 - Overall technical fit
 
-Do not reject the candidate simply because they do not
-have every preferred skill.
+Do not require every preferred skill.
 
-A candidate can still be a strong match if they satisfy
-the important requirements.
+Do not reject the candidate simply because
+one technology is missing.
 
-Keep the reason short and practical.
+Keep the reason concise.
+
+The recommendation MUST be exactly one of:
+
+apply
+consider
+skip
 """
 
     result = _generate_structured(
-        prompt=prompt,
-        schema=JobScore,
+        prompt,
+        JobScore,
     )
 
     data = result.model_dump()
 
-    # Normalize score
-    score = float(data.get("score", 0))
+    score = float(
+        data.get("score", 0)
+    )
 
     score = max(
         0.0,
@@ -429,7 +454,6 @@ Keep the reason short and practical.
 
     data["score"] = score
 
-    # Normalize recommendation
     recommendation = str(
         data.get(
             "recommendation",
@@ -442,10 +466,13 @@ Keep the reason short and practical.
         "consider",
         "skip",
     }:
+
         if score >= 75:
             recommendation = "apply"
+
         elif score >= 60:
             recommendation = "consider"
+
         else:
             recommendation = "skip"
 
@@ -455,7 +482,7 @@ Keep the reason short and practical.
 
 
 # ============================================================
-# Generate Personalized Email
+# GENERATE JOB APPLICATION EMAIL
 # ============================================================
 
 def generate_email(
@@ -464,68 +491,74 @@ def generate_email(
     score_result: dict | None = None,
 ) -> dict:
     """
-    Generate personalized job application email.
+    Generate personalized application email.
     """
 
-    candidate_json = _safe_json(candidate_profile)
-    job_json = _safe_json(job)
+    candidate_json = _safe_json(
+        candidate_profile
+    )
+
+    job_json = _safe_json(
+        job
+    )
+
     score_json = _safe_json(
         score_result or {}
     )
 
     prompt = f"""
-You are a professional technical recruiter and job-application
-email writer.
+Write a professional personalized job application email.
 
-Write a concise, personalized job application email for this
-candidate.
+CANDIDATE
+==================================================
 
-CANDIDATE:
-----------------
 {candidate_json}
-----------------
 
-JOB:
-----------------
+==================================================
+
+JOB
+==================================================
+
 {job_json}
-----------------
 
-MATCH ANALYSIS:
-----------------
+==================================================
+
+MATCH ANALYSIS
+==================================================
+
 {score_json}
-----------------
 
-EMAIL REQUIREMENTS:
+==================================================
 
-1. Make the email sound human and professional.
-2. Do not exaggerate the candidate's experience.
-3. Do not invent technologies or projects.
-4. Mention only skills supported by the candidate profile.
-5. Clearly express interest in the specific role.
-6. Mention relevant experience naturally.
-7. Mention that the resume is attached.
-8. Keep the email around 120-180 words.
-9. Do not use emojis.
-10. Do not use generic spam-like wording.
-11. Do not mention the match score.
-12. Do not say "I am the perfect candidate."
-13. Do not include placeholders such as:
-    [Company Name]
-    [Hiring Manager]
-    <company>
-14. If a hiring manager name is not available, use:
-    "Hello Hiring Team,"
-15. End professionally with:
+EMAIL RULES:
+
+1. Sound human and professional.
+2. Do not exaggerate.
+3. Do not invent experience.
+4. Do not invent projects.
+5. Do not invent technologies.
+6. Mention relevant candidate skills naturally.
+7. Clearly mention the position.
+8. Mention that the resume is attached.
+9. Keep it approximately 120-180 words.
+10. Do not mention the match score.
+11. Do not use emojis.
+12. Do not use spam-like language.
+13. Do not say "I am the perfect candidate."
+14. Do not use placeholders.
+15. If no hiring manager is provided, start with:
+
+Hello Hiring Team,
+
+16. End exactly with:
 
 Best regards,
 Pratik Raut
-
-Create a professional subject line as well.
 """
 
     result = _generate_structured(
-        prompt=prompt,
-        schema=JobEmail,
+        prompt,
+        JobEmail,
     )
 
     data = result.model_dump()
@@ -538,7 +571,10 @@ Create a professional subject line as well.
         data.get("body", "")
     ).strip()
 
+    # --------------------------------------------------------
     # Remove accidental markdown fences
+    # --------------------------------------------------------
+
     body = re.sub(
         r"^```(?:text)?\s*",
         "",
@@ -552,8 +588,12 @@ Create a professional subject line as well.
         body,
     ).strip()
 
+    # --------------------------------------------------------
     # Fallback subject
+    # --------------------------------------------------------
+
     if not subject:
+
         company = (
             job.get("company")
             or job.get("company_name")
@@ -567,11 +607,16 @@ Create a professional subject line as well.
         )
 
         subject = (
-            f"Application for {title} at {company}"
+            f"Application for {title} "
+            f"at {company}"
         )
 
+    # --------------------------------------------------------
     # Fallback email
+    # --------------------------------------------------------
+
     if not body:
+
         title = (
             job.get("title")
             or job.get("job_title")
@@ -581,12 +626,13 @@ Create a professional subject line as well.
         body = (
             "Hello Hiring Team,\n\n"
             f"I am writing to express my interest in the "
-            f"{title} position. I have experience in full-stack "
-            "web development with technologies including React, "
-            "Node.js and MongoDB.\n\n"
-            "Please find my resume attached for your consideration. "
-            "I would appreciate the opportunity to discuss how my "
-            "experience could contribute to your team.\n\n"
+            f"{title} position. I have experience in "
+            "full-stack web development with technologies "
+            "including React, Node.js and MongoDB.\n\n"
+            "Please find my resume attached for your "
+            "consideration. I would appreciate the opportunity "
+            "to discuss how my experience could contribute "
+            "to your team.\n\n"
             "Best regards,\n"
             "Pratik Raut"
         )
@@ -598,7 +644,7 @@ Create a professional subject line as well.
 
 
 # ============================================================
-# Complete Application Analysis
+# COMPLETE PIPELINE
 # ============================================================
 
 def analyze_job_application(
@@ -606,17 +652,6 @@ def analyze_job_application(
     linkedin_profile_text: str | None = None,
     job: dict | None = None,
 ) -> dict:
-    """
-    Complete pipeline:
-
-    Resume + LinkedIn
-        ->
-    Candidate Profile
-        ->
-    Job Score
-        ->
-    Personalized Email
-    """
 
     if job is None:
         job = {}
