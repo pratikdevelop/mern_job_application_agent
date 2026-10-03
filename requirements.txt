@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-ollama
+groq
 pydantic
 pydantic-settings
 sqlalchemy
@@ -11,4 +11,5 @@ google-auth-httplib2
 google-auth-oauthlib
 email-validator
 python-multipart
-google-genai
+httpx
+beautifulsoup4
